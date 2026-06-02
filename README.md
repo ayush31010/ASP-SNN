@@ -68,6 +68,183 @@ data/imagenet/
 
 ---
 
+## Exact Run Commands By Dataset
+
+Run every command in this section from the repository root folder:
+
+```bash
+git clone https://github.com/AryaPawa/ASP-SNN.git
+cd ASP-SNN
+bash setup.sh
+conda activate asp-snn
+```
+
+### No-Dataset CPU Smoke Test
+
+From folder: `ASP-SNN/`
+
+```bash
+python smoke_test.py
+```
+
+Expected result:
+
+```text
+ALL 8 TESTS PASSED
+```
+
+### ShapeNetPart Segmentation
+
+From folder: `ASP-SNN/`
+
+Download ShapeNetPart:
+
+```bash
+python datasets/download.py --shapenet
+```
+
+Quick 2-epoch smoke training:
+
+```bash
+python train_shapenet.py --config configs/shapenet_seg.yaml \
+  --set epochs=2 batch_size=4 num_workers=0 eval_interval=1
+```
+
+Full training:
+
+```bash
+python train_shapenet.py --config configs/shapenet_seg.yaml
+```
+
+Evaluate:
+
+```bash
+python eval_shapenet.py --ckpt checkpoints/shapenet_best.pt --config configs/shapenet_seg.yaml --per_cat
+```
+
+### ScanObjectNN Classification
+
+From folder: `ASP-SNN/`
+
+Download ScanObjectNN:
+
+```bash
+python datasets/download.py --scanobj
+```
+
+Quick 2-epoch smoke training:
+
+```bash
+python train_scanobj.py --config configs/scanobj_cls.yaml \
+  --set epochs=2 batch_size=4 num_workers=0 eval_interval=1
+```
+
+Full training:
+
+```bash
+python train_scanobj.py --config configs/scanobj_cls.yaml
+```
+
+Evaluate:
+
+```bash
+python eval_scanobj.py --ckpt checkpoints/scanobj_best.pt --config configs/scanobj_cls.yaml --n_votes 10
+```
+
+### S3DIS Semantic Segmentation
+
+From folder: `ASP-SNN/`
+
+Download S3DIS:
+
+```bash
+python datasets/download.py --s3dis
+```
+
+Quick 2-epoch smoke training:
+
+```bash
+python train_s3dis.py --config configs/s3dis_seg.yaml \
+  --set epochs=2 batch_size=4 num_workers=0 eval_interval=1
+```
+
+Full training:
+
+```bash
+python train_s3dis.py --config configs/s3dis_seg.yaml
+```
+
+Evaluate:
+
+```bash
+python eval_s3dis.py --ckpt checkpoints/s3dis_best.pt --config configs/s3dis_seg.yaml --per_class
+```
+
+### ImageNet Or ImageNet-100 FoveaTer ASP
+
+From folder: `ASP-SNN/`
+
+First arrange data manually in ImageFolder format:
+
+```text
+/path/to/imagenet/
+  train/class_name_or_wnid/*.JPEG
+  val/class_name_or_wnid/*.JPEG
+```
+
+Synthetic smoke training without ImageNet:
+
+```bash
+python train_imagenet_foveater.py --config configs/imagenet_foveater.yaml \
+  --set smoke=true epochs=1 batch_size=2 image_size=64 feature_grid=4 \
+        embed_dim=48 depth=1 max_fixations=2 max_tokens=8 debug_steps=1 \
+        num_workers=0 use_amp=false num_classes=10
+```
+
+Train on full ImageNet:
+
+```bash
+python train_imagenet_foveater.py --config configs/imagenet_foveater.yaml \
+  --set data_dir=/path/to/imagenet num_classes=1000 batch_size=128
+```
+
+Train on ImageNet-100:
+
+```bash
+python train_imagenet_foveater.py --config configs/imagenet_foveater.yaml \
+  --set data_dir=/path/to/imagenet100 num_classes=100 batch_size=128
+```
+
+### Parallel GPU Smoke Training
+
+From folder: `ASP-SNN/`
+
+Run quick smoke-training jobs in parallel on GPUs 0, 1, 2, and 3:
+
+```bash
+bash scripts/smoke_train_parallel.sh
+```
+
+Choose GPU IDs explicitly:
+
+```bash
+GPU_SHAPENET=0 GPU_SCANOBJ=1 GPU_S3DIS=2 GPU_FOVEATER=3 \
+  bash scripts/smoke_train_parallel.sh
+```
+
+Manual parallel full training:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_shapenet.py --config configs/shapenet_seg.yaml &
+CUDA_VISIBLE_DEVICES=1 python train_scanobj.py --config configs/scanobj_cls.yaml &
+CUDA_VISIBLE_DEVICES=2 python train_s3dis.py --config configs/s3dis_seg.yaml &
+CUDA_VISIBLE_DEVICES=3 python train_imagenet_foveater.py --config configs/imagenet_foveater.yaml \
+  --set data_dir=/path/to/imagenet num_classes=1000 &
+wait
+```
+
+---
+
 ## Architecture
 
 ```
@@ -147,7 +324,8 @@ ASP-SNN/
 │   ├── run_scanobj.sh              #   8h wall, 1 GPU, 8 CPUs, 32G
 │   ├── run_s3dis.sh                #   24h wall, 1 GPU, 8 CPUs, 64G
 │   ├── run_imagenet_foveater.sh    #   FoveaTer ASP ImageNet helper
-│   └── smoke_train.sh              #   Quick 2-epoch test for all 3 datasets
+│   ├── smoke_train.sh              #   Quick serial 2-epoch test for all 3 point-cloud datasets
+│   └── smoke_train_parallel.sh     #   Quick parallel smoke jobs across GPUs
 │
 ├── config.py                       # YAML loader with auto type casting + CLI overrides
 │
