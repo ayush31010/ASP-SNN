@@ -227,7 +227,6 @@ class ModelNet40Dataset(Dataset):
 # ── 4. Import project modules ──────────────────────────────────────────────────
 from models.spiking_mamba import SPMModel
 from models.asp_wrapper import ASPWrapper
-from data.slicing import slice_fps_hierarchical_batch
 from training.train_active import prepare_fps_slices_and_geo, gumbel_tau
 from training.loss_active import active_loss
 from training.metrics import accuracy
@@ -289,30 +288,6 @@ def make_scheduler(opt, warmup_ep, total_ep):
 
 # ── 8. Training helpers ────────────────────────────────────────────────────────
 
-def train_spm_epoch(model, loader, optimizer, epoch):
-    model.train()
-    total_loss = total_acc = n = 0
-    for pts, labels in loader:
-        pts, labels = pts.to(device), labels.to(device)
-        B = pts.size(0)
-        model.reset_state(B, device)
-        model._total_T = T
-        pts_slices = slice_fps_hierarchical_batch(pts, T=T)
-        logits = None
-        for t in range(T):
-            logits = model.forward_step(pts_slices[:, t])
-        loss = F.cross_entropy(logits, labels, label_smoothing=LABEL_SMOOTH)
-        if torch.isfinite(loss):
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        total_loss += loss.item() * B
-        total_acc  += (logits.argmax(1) == labels).sum().item()
-        n          += B
-    return total_loss / n, total_acc / n
-
-
 def train_asp_epoch(model, loader, optimizer, epoch):
     model.train()
     progress = epoch / max(EPOCHS - 1, 1)
@@ -342,24 +317,6 @@ def train_asp_epoch(model, loader, optimizer, epoch):
         total_acc  += (logits_final.argmax(1) == labels).sum().item()
         n          += B
     return total_loss / n, total_acc / n
-
-
-@torch.no_grad()
-def eval_spm(model, loader):
-    model.eval()
-    correct = total = 0
-    for pts, labels in loader:
-        pts, labels = pts.to(device), labels.to(device)
-        B = pts.size(0)
-        model.reset_state(B, device)
-        model._total_T = T
-        pts_slices = slice_fps_hierarchical_batch(pts, T=T)
-        logits = None
-        for t in range(T):
-            logits = model.forward_step(pts_slices[:, t])
-        correct += (logits.argmax(1) == labels).sum().item()
-        total   += B
-    return correct / total
 
 
 @torch.no_grad()
@@ -405,54 +362,16 @@ val_loader   = DataLoader(val_ds,   BATCH, shuffle=False, num_workers=4,
                           pin_memory=True)
 print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
 
-# ── 10. SPM baseline ───────────────────────────────────────────────────────────
+# ── 10. ASP+SPM training ──────────────────────────────────────────────────────
 print(f"\n{'='*70}")
-print("Phase 1: SPM Baseline (fixed FPS slice order)")
-print(f"{'='*70}")
-
-spm = make_spm()
-spm_params = sum(p.numel() for p in spm.parameters())
-print(f"SPM params: {spm_params:,}")
-
-spm_opt = torch.optim.AdamW(spm.parameters(), lr=LR, weight_decay=WD)
-spm_sch = make_scheduler(spm_opt, WARMUP_EP, EPOCHS)
-best_spm = 0.0
-spm_history = []
-
-for epoch in range(EPOCHS):
-    t0 = time.time()
-    tr_loss, tr_acc = train_spm_epoch(spm, train_loader, spm_opt, epoch)
-    spm_sch.step()
-    spm_history.append({"epoch": epoch, "train_acc": tr_acc})
-
-    if (epoch + 1) % 10 == 0 or epoch == EPOCHS - 1:
-        val_acc = eval_spm(spm, val_loader)
-        if val_acc > best_spm:
-            best_spm = val_acc
-            torch.save(spm.state_dict(), os.path.join(CKPT_DIR, "spm_best.pth"))
-        spm_history[-1]["val_acc"] = val_acc
-        elapsed = time.time() - t0
-        lr_now = spm_opt.param_groups[0]["lr"]
-        print(f"[SPM] Ep {epoch+1:3d}/{EPOCHS} | TrainAcc={tr_acc:.4f} "
-              f"| ValAcc={val_acc:.4f} {'★' if val_acc == best_spm else ' '} "
-              f"| LR={lr_now:.5f} | {elapsed:.0f}s")
-    elif (epoch + 1) % 2 == 0:
-        lr_now = spm_opt.param_groups[0]["lr"]
-        print(f"[SPM] Ep {epoch+1:3d}/{EPOCHS} | TrainAcc={tr_acc:.4f} "
-              f"| LR={lr_now:.5f} | {time.time()-t0:.0f}s")
-
-print(f"\nSPM Best Val: {best_spm*100:.2f}%")
-
-# ── 11. ASP+SPM (improved) ─────────────────────────────────────────────────────
-print(f"\n{'='*70}")
-print("Phase 2: ASP+SPM — Improved (GRU belief + Multi-head SSP + Diversity loss)")
+print("ASP+SPM — GRU belief + Multi-head SSP + Diversity loss")
 print(f"  d_ssp=128, n_heads=4, diversity=0.1")
 print(f"  LAM_DIV={LAM_DIV}, LAM_EXIT={LAM_EXIT} (progressive), TTA={TTA_VOTES} votes")
 print(f"{'='*70}")
 
 asp = make_asp()
 asp_params = sum(p.numel() for p in asp.parameters())
-print(f"ASP params: {asp_params:,}  (+SSP/GRU overhead: {asp_params-spm_params:,})")
+print(f"ASP params: {asp_params:,}")
 
 asp_opt = torch.optim.AdamW(asp.parameters(), lr=LR, weight_decay=WD)
 asp_sch = make_scheduler(asp_opt, WARMUP_EP, EPOCHS)
@@ -489,38 +408,30 @@ for epoch in range(EPOCHS):
 
 print(f"\nASP Best Val: {best_asp*100:.2f}% (TTA={TTA_VOTES})")
 
-# ── 12. Final evaluation (best checkpoint, full TTA) ──────────────────────────
+# ── 11. Final evaluation (best checkpoint, full TTA) ──────────────────────────
 print(f"\n{'='*70}")
-print("Final Evaluation — Best Checkpoints + Full TTA")
+print("Final Evaluation — Best Checkpoint + Full TTA")
 print(f"{'='*70}")
 
-spm.load_state_dict(torch.load(os.path.join(CKPT_DIR, "spm_best.pth"), map_location=device))
 asp.load_state_dict(torch.load(os.path.join(CKPT_DIR, "asp_best.pth"), map_location=device))
-
-spm_final = eval_spm(spm, val_loader)
 asp_final, asp_slices_final = eval_asp(asp, val_loader, tta=TTA_VOTES)
 
-print(f"\n  SPM  OA: {spm_final*100:.2f}%")
-print(f"  ASP  OA: {asp_final*100:.2f}%  (avg {asp_slices_final:.2f}/{T} slices, TTA={TTA_VOTES})")
-print(f"  Δ (ASP - SPM): {(asp_final - spm_final)*100:+.2f} pp")
+print(f"\n  ASP  OA: {asp_final*100:.2f}%  (avg {asp_slices_final:.2f}/{T} slices, TTA={TTA_VOTES})")
 
 E_AC, E_MAC = 2.3e-3, 8.4e-3
 fr_est = 0.15
 energy = fr_est * E_AC / E_MAC * (asp_slices_final / T)
 print(f"  Est. energy vs ANN: {energy*100:.1f}%  (fr≈{fr_est}, Loihi 2 constants)")
 
-# ── 13. Save results ───────────────────────────────────────────────────────────
+# ── 12. Save results ───────────────────────────────────────────────────────────
 results = {
     "dataset": "ModelNet40",
     "num_classes": NUM_CLASSES,
     "epochs": EPOCHS,
     "tta_votes": TTA_VOTES,
-    "spm_oa": spm_final,
     "asp_oa": asp_final,
     "asp_avg_slices": asp_slices_final,
-    "delta_pp": (asp_final - spm_final) * 100,
     "energy_vs_ann": energy,
-    "spm_history": spm_history,
     "asp_history": asp_history,
 }
 out_path = os.path.join(CKPT_DIR, "results_mn40.json")
