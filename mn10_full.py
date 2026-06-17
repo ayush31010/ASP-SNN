@@ -127,8 +127,14 @@ def _z_rotate(pts):
     R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
     return pts @ R.T
 
+def _so3_rotate(pts):
+    """Uniformly random 3D rotation (full SO3)."""
+    from scipy.spatial.transform import Rotation
+    R = Rotation.random().as_matrix().astype(np.float32)
+    return pts @ R.T
+
 def _augment_strong(pts):
-    pts = _z_rotate(pts)
+    pts = _so3_rotate(pts)   # full SO3 (replaces z-rotate only)
     pts = pts * np.random.uniform(0.8, 1.25, (1, 3)).astype(np.float32)
     pts += np.clip(np.random.normal(0, 0.01, pts.shape), -0.05, 0.05).astype(np.float32)
     N    = pts.shape[0]
@@ -210,13 +216,14 @@ class ModelNet10Dataset(Dataset):
 # ── 4. Import project modules ──────────────────────────────────────────────────
 from models.spiking_mamba import SPMModel
 from models.asp_wrapper   import ASPWrapper
+from models.pointnet_backbone import MultiScalePointNetBackbone
 from data.slicing         import slice_fps_hierarchical_batch
 from training.train_active import prepare_fps_slices_and_geo, gumbel_tau
 from training.loss_active  import active_loss
 from training.metrics      import accuracy
 
 # ── 5. Hyperparameters ─────────────────────────────────────────────────────────
-EPOCHS       = 200
+EPOCHS       = 600     # 600 epochs for full convergence
 BATCH        = 32
 LR           = 5e-4
 WD           = 1e-4
@@ -225,8 +232,8 @@ NUM_CLASSES  = 10
 T            = 4        # slices (256 pts/slice)
 FEAT_DIM     = 512
 POINT_DIMS   = (128, 256, 512)
-D_STATE      = 16
-N_SMB        = 2
+D_STATE      = 32      # 32-dim SSM state (was 16)
+N_SMB        = 4       # 4 Spiking Mamba Blocks (was 2)
 KNN_K        = 16
 TAU_LIF      = 0.9
 WARMUP_EP    = 20
@@ -238,25 +245,49 @@ LAM_FR       = 0.02
 LAM_DIV      = 0.05
 LABEL_SMOOTH = 0.1
 KD_TEMP      = 4.0    # KD softmax temperature
-KD_LAM       = 0.5    # KD loss weight
-TEACHER_EP   = 20     # epochs to pre-train PointNet teacher (small dataset)
+KD_LAM       = 0.3    # KD loss weight (was 0.5 — reduced to prevent collapse)
+TEACHER_EP   = 40     # epochs to pre-train PointNet teacher (was 20)
 CKPT_DIR     = os.path.join(WORK, "mn10_ckpts")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── 6. Model builders ──────────────────────────────────────────────────────────
+
+class MSBackboneAdapter(nn.Module):
+    """Wraps MultiScalePointNetBackbone to return [B, 1, D] for ASPWrapper compat."""
+    def __init__(self, hidden_dims, out_dim, use_plif=True):
+        super().__init__()
+        self.ms = MultiScalePointNetBackbone(
+            hidden_dims=hidden_dims, out_dim=out_dim, use_plif=use_plif
+        )
+        self.out_dim = out_dim
+
+    def reset_state(self, batch_size, device=None):
+        pass
+
+    def firing_rates(self):
+        return self.ms.firing_rates() if hasattr(self.ms, 'firing_rates') else {}
+
+    def forward(self, pts):  # [B, N, 3] → [B, 1, out_dim]
+        return self.ms(pts).unsqueeze(1)
+
+
 def make_spm():
-    return SPMModel(
+    spm = SPMModel(
         num_classes  = NUM_CLASSES,
         point_dims   = POINT_DIMS,
         d_state      = D_STATE,
         tau          = TAU_LIF,
         n_smb_layers = N_SMB,
-        local_knn    = True,
-        knn_k        = KNN_K,
+        local_knn    = False,
         learnable_lif= False,
+        pooling      = "mean",
     ).to(device)
+    spm.backbone = MSBackboneAdapter(
+        hidden_dims=POINT_DIMS, out_dim=FEAT_DIM, use_plif=True,
+    ).to(device)
+    return spm
 
 def make_asp():
     return ASPWrapper(
@@ -324,6 +355,41 @@ def pretrain_teacher(teacher, loader, epochs):
     teacher.eval()
     print("[KD] Teacher ready.")
     return teacher
+
+# ── 8b. EMA ────────────────────────────────────────────────────────────────────
+
+class EMA:
+    """Exponential Moving Average of model parameters (+0.3–0.5% OA at eval)."""
+    def __init__(self, model, decay=0.9995):
+        self.decay = decay
+        self.shadow = {k: v.data.float().clone()
+                       for k, v in model.named_parameters() if v.requires_grad}
+
+    def update(self, model):
+        for k, v in model.named_parameters():
+            if v.requires_grad and k in self.shadow:
+                self.shadow[k] = self.decay * self.shadow[k] + (1 - self.decay) * v.data.float()
+
+    def apply(self, model):
+        orig = {k: v.data.clone() for k, v in model.named_parameters() if v.requires_grad}
+        for k, v in model.named_parameters():
+            if v.requires_grad and k in self.shadow:
+                v.data.copy_(self.shadow[k].to(v.dtype))
+        return orig
+
+    def restore(self, model, orig):
+        for k, v in model.named_parameters():
+            if k in orig:
+                v.data.copy_(orig[k])
+
+    def state_dict(self):
+        return {k: v.cpu() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, sd):
+        for k, v in sd.items():
+            if k in self.shadow:
+                self.shadow[k] = v.float()
+
 
 # ── 9. Training helpers ────────────────────────────────────────────────────────
 
@@ -501,21 +567,26 @@ asp_sch = make_scheduler(asp_opt)
 best_asp = 0.0
 best_asp_slices = T
 asp_history = []
+asp_ema = EMA(asp, decay=0.9995)
 
 for epoch in range(EPOCHS):
     t0 = time.time()
     tr_loss, tr_acc = train_asp_epoch(asp, train_loader, asp_opt, epoch, teacher=teacher)
     asp_sch.step()
+    asp_ema.update(asp)
     asp_history.append({"epoch": epoch, "train_acc": tr_acc})
 
     lr_now = asp_opt.param_groups[0]["lr"]
     if (epoch + 1) % 5 == 0 or epoch == EPOCHS - 1:
-        tta = TTA_VOTES if (epoch == EPOCHS - 1 or (epoch + 1) % 50 == 0) else 1
+        tta = TTA_VOTES if (epoch == EPOCHS - 1 or (epoch + 1) % 50 == 0) else 3
+        orig_w = asp_ema.apply(asp)
         val_acc, val_slices = eval_asp(asp, val_loader, tta=tta)
+        asp_ema.restore(asp, orig_w)
         if val_acc > best_asp:
             best_asp = val_acc
             best_asp_slices = val_slices
             torch.save(asp.state_dict(), os.path.join(CKPT_DIR, "asp_best.pth"))
+            torch.save(asp_ema.state_dict(), os.path.join(CKPT_DIR, "asp_best_ema.pth"))
         asp_history[-1]["val_acc"] = val_acc
         tta_str = f" TTA={tta}" if tta > 1 else ""
         star = "★" if val_acc == best_asp else " "
@@ -534,10 +605,20 @@ print("Final Evaluation — Best Checkpoints + Full TTA")
 print(f"{'='*70}")
 
 spm.load_state_dict(torch.load(os.path.join(CKPT_DIR, "spm_best.pth"), map_location=device))
-asp.load_state_dict(torch.load(os.path.join(CKPT_DIR, "asp_best.pth"), map_location=device))
+
+# Use EMA weights for final ASP eval
+ema_path = os.path.join(CKPT_DIR, "asp_best_ema.pth")
+if os.path.isfile(ema_path):
+    asp_ema.load_state_dict(torch.load(ema_path, map_location=device))
+    asp.load_state_dict(torch.load(os.path.join(CKPT_DIR, "asp_best.pth"), map_location=device))
+    orig_w = asp_ema.apply(asp)
+else:
+    asp.load_state_dict(torch.load(os.path.join(CKPT_DIR, "asp_best.pth"), map_location=device))
+    orig_w = asp_ema.apply(asp)
 
 spm_final              = eval_spm(spm, val_loader)
 asp_final, asp_slices  = eval_asp(asp, val_loader, tta=TTA_VOTES)
+asp_ema.restore(asp, orig_w)
 
 E_AC, E_MAC = 2.3e-3, 8.4e-3
 energy = 0.15 * E_AC / E_MAC * (asp_slices / T)

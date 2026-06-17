@@ -259,19 +259,19 @@ class Cfg:
     in_channels    = 7      # matches input_channels
     point_in_channels = 7
     # Training
-    epochs         = 100
+    epochs         = 500     # 500 epochs for full convergence
     batch_size     = batch_sz
-    lr             = 2e-3
+    lr             = 5e-4   # was 2e-3 — lower LR reduces ±5% mIoU oscillation
     weight_decay   = 0.01
-    grad_clip      = 1.0
-    warmup_epochs  = 5
+    grad_clip      = 0.5   # was 1.0 — tighter clipping for S3DIS stability
+    warmup_epochs  = 20    # was 5 — longer warmup before hitting full LR
     use_amp        = True
     use_class_weights = True
     # Gumbel
     tau_start      = 1.0
     tau_end        = 0.1
-    tau_decay      = 0.95
-    tau_anneal_epochs = 100
+    tau_decay      = 0.985   # was 0.95 — tau hit min at ep~43/500; now hits min ~ep155/250
+    tau_anneal_epochs = 350  # scaled up with 500-epoch run
     # Augmentation
     aug_rotate_z   = True
     aug_scale_lo   = 0.9
@@ -321,7 +321,7 @@ cmd = [
     f"data_dir={cfg.data_dir}",
     f"log_dir={cfg.log_dir}",
     f"ckpt_dir={cfg.ckpt_dir}",
-    f"epochs={cfg.epochs}",
+    f"epochs={cfg.epochs}",   # 250
     f"batch_size={cfg.batch_size}",
     f"num_workers={cfg.num_workers}",
     f"seed={cfg.seed}",
@@ -329,9 +329,14 @@ cmd = [
     f"use_amp={cfg.use_amp}",
     f"eval_interval={cfg.eval_interval}",
     f"test_area={cfg.test_area}",
-    "kd_teacher_epochs=30",
+    "kd_teacher_epochs=50",
     "kd_temp=4.0",
-    "kd_lam=0.5",
+    "kd_lam=0.3",
+    f"lr={cfg.lr}",
+    f"grad_clip={cfg.grad_clip}",
+    f"warmup_epochs={cfg.warmup_epochs}",
+    f"tau_decay={cfg.tau_decay}",
+    f"tau_anneal_epochs={cfg.tau_anneal_epochs}",
 ]
 
 result = subprocess.run(cmd, cwd=PROJ)

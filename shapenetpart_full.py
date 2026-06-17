@@ -231,7 +231,7 @@ class Cfg:
     point_feat_dim   = 128
     seg_head_dropout = 0.1
     # Training
-    epochs           = 250
+    epochs           = 500     # 500 epochs for full convergence
     batch_size       = 32
     lr               = 3e-4
     encoder_lr_scale = 1.0
@@ -251,8 +251,8 @@ class Cfg:
     tau_end          = 0.1
     tau_anneal_epochs = 200
     # Augmentation
-    aug_rotate_so3   = False
-    aug_rotate_z     = True
+    aug_rotate_so3   = True    # full SO3 rotation (was False)
+    aug_rotate_z     = False   # SO3 supersedes z-only rotation
     aug_scale_lo     = 0.8
     aug_scale_hi     = 1.25
     aug_translate    = 0.1
@@ -301,7 +301,7 @@ cmd = [
     f"data_dir={cfg.data_dir}",
     f"log_dir={cfg.log_dir}",
     f"ckpt_dir={cfg.ckpt_dir}",
-    f"epochs={cfg.epochs}",
+    f"epochs={cfg.epochs}",   # 500
     f"batch_size={cfg.batch_size}",
     f"num_workers={cfg.num_workers}",
     f"seed={cfg.seed}",
@@ -310,9 +310,11 @@ cmd = [
     f"eval_interval={cfg.eval_interval}",
     f"checkpoint_interval={cfg.checkpoint_interval}",
     f"early_stopping_patience={cfg.early_stopping_patience}",
-    "kd_teacher_epochs=30",
+    "kd_teacher_epochs=50",
     "kd_temp=4.0",
-    "kd_lam=0.5",
+    "kd_lam=0.3",
+    "aug_rotate_so3=True",
+    "aug_rotate_z=False",
 ]
 
 result = subprocess.run(cmd, cwd=PROJ)

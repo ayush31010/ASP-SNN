@@ -183,7 +183,7 @@ class Cfg:
     T             = 6
     cls_head_dims = [256, 128]
     cls_head_dropout = [0.3, 0.2]
-    epochs        = 300
+    epochs        = 600     # 600 epochs for full convergence
     batch_size    = 32
     lr            = 4e-4
     weight_decay  = 0.01
@@ -207,8 +207,8 @@ class Cfg:
     exit_threshold = 0.40
     in_channels   = 6
     kd_temp       = 4.0    # KD softmax temperature
-    kd_lam        = 0.5    # KD loss weight
-    kd_teacher_ep = 30     # epochs to pre-train PointNet teacher
+    kd_lam        = 0.3    # KD loss weight (was 0.5 — reduced to prevent collapse)
+    kd_teacher_ep = 50     # epochs to pre-train PointNet teacher (was 30)
     aug_rotate_z  = True
     aug_scale_lo  = 0.85
     aug_scale_hi  = 1.15

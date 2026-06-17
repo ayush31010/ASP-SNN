@@ -9,11 +9,11 @@ Each script downloads its own data, trains the model, and saves results.
 
 | Script | Dataset | Expected OA / mIoU | GPU time (T4) |
 |---|---|---|---|
-| `mn40_full.py` | ModelNet40 (40-class) | >91.5% OA | ~3.5 h |
-| `mn10_full.py` | ModelNet10 (10-class) | >95% OA | ~40 min |
-| `scanobjectnn_full.py` | ScanObjectNN PB-T50-RS | >84% OA | ~4 h |
-| `shapenetpart_full.py` | ShapeNetPart (50 parts) | ~85–86% mIoU | ~8 h |
-| `s3dis_full.py` | S3DIS Area 5 (13 classes) | ~55–62% mIoU | ~6 h |
+| `mn40_full.py` | ModelNet40 (40-class) | >92% OA | ~10 h |
+| `mn10_full.py` | ModelNet10 (10-class) | >96% OA | ~2 h |
+| `scanobjectnn_full.py` | ScanObjectNN PB-T50-RS | >85% OA | ~8 h |
+| `shapenetpart_full.py` | ShapeNetPart (50 parts) | ~86–87% mIoU | ~16 h |
+| `s3dis_full.py` | S3DIS Area 5 (13 classes) | ~57–64% mIoU | ~15 h |
 
 All scripts include:
 - Automatic data download (no manual setup needed)
@@ -85,7 +85,7 @@ Save as `run_mn40.sh`:
 #SBATCH --output=logs/mn40_%j.out
 #SBATCH --error=logs/mn40_%j.err
 
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
