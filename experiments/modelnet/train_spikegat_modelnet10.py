@@ -41,6 +41,7 @@ AMP_ENABLED = DEVICE == "cuda"
 if DEVICE == "cuda":
     print("GPU:", torch.cuda.get_device_name(0),
           round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1), "GB")
+    torch.backends.cudnn.benchmark = True
 else:
     print("WARNING: no GPU found — will be very slow")
 
@@ -63,9 +64,11 @@ WD_SGD       = 1e-5
 LABEL_SMOOTH = 0.2
 
 # Knowledge distillation
-TEACHER_EPOCHS = int(os.environ.get("TEACHER_EPOCHS", "200"))
-KD_TEMP        = 4.0
-KD_ALPHA       = 0.35
+TEACHER_EPOCHS       = int(os.environ.get("TEACHER_EPOCHS", "200"))
+KD_TEMP              = 4.0
+KD_ALPHA             = 0.35
+CACHE_TEACHER_LOGITS = True   # cache canonical targets on CPU; frees GPU VRAM
+FAST_KNN_FP16        = True   # tensor-core FP16 pairwise distances (index-only, safe)
 
 # Eval
 VAL_EVERY   = 5
@@ -98,13 +101,16 @@ CKPT_DIR = os.environ.get(
 MN10_DIR = os.environ.get("MODELNET10_DIR", "")
 
 os.makedirs(CKPT_DIR, exist_ok=True)
-T_LATEST = os.path.join(CKPT_DIR, "teacher_latest.pt")
-T_BEST   = os.path.join(CKPT_DIR, "teacher_best.pth")
-S_LATEST = os.path.join(CKPT_DIR, "spikegat_mn10_latest.pt")
-S_BEST   = os.path.join(CKPT_DIR, "spikegat_mn10_best.pth")
+T_LATEST  = os.path.join(CKPT_DIR, "teacher_latest.pt")
+T_BEST    = os.path.join(CKPT_DIR, "teacher_best.pth")
+T_TARGETS = os.path.join(CKPT_DIR, "teacher_train_targets.pt")
+S_LATEST  = os.path.join(CKPT_DIR, "spikegat_mn10_latest.pt")
+S_BEST    = os.path.join(CKPT_DIR, "spikegat_mn10_best.pth")
 
 print(f"\nConfig: k={K} T={APTEC_T} ep={EPOCHS} batch={BATCH} "
       f"lr={LR_SGD}→{LR_MIN} kd_temp={KD_TEMP} seed={SEED}")
+print(f"T4 profile: teacher_ep={TEACHER_EPOCHS} cached_KD={CACHE_TEACHER_LOGITS} "
+      f"fp16_KNN={FAST_KNN_FP16}")
 print(f"Ckpts: {CKPT_DIR}")
 
 # ── 2. Validate ModelNet10 ────────────────────────────────────────────────────
@@ -188,7 +194,8 @@ class ModelNetDataset(Dataset):
         pts = augment(self.data[idx].copy(), self.split)
         np.random.shuffle(pts)
         return (torch.tensor(pts, dtype=torch.float32),
-                torch.tensor(self.labels[idx], dtype=torch.long))
+                torch.tensor(self.labels[idx], dtype=torch.long),
+                torch.tensor(idx, dtype=torch.long))
 
 # ── 6. Spiking primitives ─────────────────────────────────────────────────────
 
@@ -230,15 +237,22 @@ class APTECNeuron(nn.Module):
 
 @torch.no_grad()
 def knn_idx(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Dynamic KNN in feature space.  x: [B, N, C] → [B, N, k]"""
     with torch.autocast(device_type="cuda", enabled=False):
-        xf = x.float()
+        if FAST_KNN_FP16 and x.is_cuda:
+            xh = x.detach().to(torch.float16)
+            xf = xh.float()
+            dot = torch.bmm(xh, xh.transpose(1, 2)).float()
+        else:
+            xf = x.detach().float()
+            dot = torch.bmm(xf, xf.transpose(1, 2))
         aa = (xf * xf).sum(-1, keepdim=True)
-        sq = aa + aa.transpose(1, 2) - 2.0 * torch.bmm(xf, xf.transpose(1, 2))
+        sq = aa + aa.transpose(1, 2) - 2.0 * dot
         sq = sq.clamp(min=0.0)
     N  = sq.shape[1]
     di = torch.arange(N, device=x.device)
     sq[:, di, di] = float("inf")
-    return sq.topk(k, dim=-1, largest=False).indices
+    return sq.topk(k, dim=-1, largest=False).indices  # [B, N, k]
 
 
 def graph_features(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -489,7 +503,7 @@ def train_teacher_epoch(model, loader, opt):
     model.train()
     tl = ta = n = 0
     opt.zero_grad()
-    for pts, lbl in loader:
+    for pts, lbl, _ in loader:
         pts, lbl = pts.to(DEVICE), lbl.to(DEVICE)
         with autocast("cuda", enabled=AMP_ENABLED):
             lg   = model(pts)
@@ -509,13 +523,56 @@ def train_teacher_epoch(model, loader, opt):
 def eval_model(model, loader):
     model.eval()
     correct = total = 0
-    for pts, lbl in loader:
+    for pts, lbl, _ in loader:
         pts, lbl = pts.to(DEVICE), lbl.to(DEVICE)
         with autocast("cuda", enabled=AMP_ENABLED):
             logits = model(pts)
         correct += (logits.argmax(1) == lbl).sum().item()
         total   += pts.shape[0]
     return correct / total
+
+
+@torch.no_grad()
+def build_teacher_targets(model, dataset, path, teacher_oa):
+    """Cache one canonical teacher distribution per training shape on CPU."""
+    if os.path.isfile(path):
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            logits = payload["logits"]
+            valid = (payload.get("version") == 1 and
+                     logits.shape == (len(dataset), NUM_CLASSES) and
+                     abs(float(payload.get("teacher_oa", -1.0)) - teacher_oa) < 1e-8)
+            if valid:
+                print(f"Loaded cached teacher targets: {tuple(logits.shape)}")
+                return logits
+        except Exception as e:
+            print(f"  [cache] rebuilding teacher targets: {e}")
+
+    print("Caching canonical teacher targets (one inference pass) …")
+    old_split = dataset.split
+    dataset.split = "test"
+    cache_loader = DataLoader(dataset, BATCH, shuffle=False, num_workers=0,
+                              pin_memory=AMP_ENABLED)
+    logits = torch.empty(len(dataset), NUM_CLASSES, dtype=torch.float16)
+    try:
+        model.eval()
+        for pts, _, idx in cache_loader:
+            pts = pts.to(DEVICE, non_blocking=True)
+            with autocast("cuda", enabled=AMP_ENABLED):
+                batch_logits = model(pts)
+            logits[idx] = batch_logits.detach().cpu().to(torch.float16)
+    finally:
+        dataset.split = old_split
+
+    payload = {"version": 1, "teacher_oa": teacher_oa, "logits": logits}
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+    print(f"Saved cached teacher targets: {path}")
+    return logits
 
 
 if t_ep >= TEACHER_EPOCHS and os.path.isfile(T_BEST):
@@ -554,6 +611,15 @@ missing, unexpected = student.load_state_dict(transfer, strict=False)
 print(f"Transferred {len(transfer)}/{len(student_state)} teacher tensors to student "
       f"({len(missing)} APTEC-only/missing, {len(unexpected)} unexpected).")
 
+teacher_targets = None
+if CACHE_TEACHER_LOGITS:
+    teacher_targets = build_teacher_targets(teacher, train_ds, T_TARGETS, t_best)
+    if AMP_ENABLED:
+        teacher_targets = teacher_targets.pin_memory()
+    teacher.to("cpu")
+    torch.cuda.empty_cache()
+    print("Teacher moved to CPU; student KD now uses the cached targets.")
+
 # ── 15. SpikeGAT student training ────────────────────────────────────────────
 print("\n" + "=" * 60 + "\nPhase 2 — SpikeGAT + KD\n" + "=" * 60)
 
@@ -568,15 +634,19 @@ if s_ep == 0 and os.path.isfile(S_LATEST + ".bak"):
 print(f"Student start ep={s_ep}  best={s_best*100:.2f}%")
 
 
-def train_student_epoch(model, loader, opt, teacher_model):
+def train_student_epoch(model, loader, opt, cached_targets, teacher_model=None):
     model.train()
     tl = ta = n = 0
     opt.zero_grad()
-    for pts, lbl in loader:
+    for pts, lbl, idx in loader:
         pts, lbl = pts.to(DEVICE), lbl.to(DEVICE)
 
         with torch.no_grad():
-            t_lg = teacher_model(pts)
+            if cached_targets is not None:
+                t_lg = cached_targets[idx].to(DEVICE, dtype=torch.float32,
+                                               non_blocking=True)
+            else:
+                t_lg = teacher_model(pts)
 
         with autocast("cuda", enabled=AMP_ENABLED):
             s_lg = model(pts)
@@ -604,7 +674,7 @@ def eval_student(model, loader, use_tta=False):
     model.eval()
     correct = total = 0
     scales = TTA_SCALES if use_tta else (1.0,)
-    for pts, lbl in loader:
+    for pts, lbl, _ in loader:
         pts, lbl = pts.to(DEVICE), lbl.to(DEVICE)
         pr = torch.zeros(pts.shape[0], NUM_CLASSES, device=DEVICE)
         for scale in scales:
@@ -617,7 +687,9 @@ def eval_student(model, loader, use_tta=False):
 
 for ep in range(s_ep, EPOCHS):
     t0 = time.time()
-    tr_loss, tr_acc = train_student_epoch(student, train_loader, s_opt, teacher)
+    tr_loss, tr_acc = train_student_epoch(
+        student, train_loader, s_opt, teacher_targets,
+        None if CACHE_TEACHER_LOGITS else teacher)
     s_sch.step()
     lr = s_opt.param_groups[0]["lr"]
     print(f"Ep {ep+1:3d}/{EPOCHS}  loss={tr_loss:.4f}  "
